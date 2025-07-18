@@ -1,149 +1,126 @@
 // socket.js - Socket.io client setup
 
+// socket/socket.js
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { io } from 'socket.io-client';
-import { useEffect, useState } from 'react';
 
-// Socket.io connection URL
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:5000';
+const socket = io('http://localhost:5000'); // Update this to your server URL if different
 
-// Create socket instance
-export const socket = io(SOCKET_URL, {
-  autoConnect: false,
-  reconnection: true,
-  reconnectionAttempts: 5,
-  reconnectionDelay: 1000,
-});
-
-// Custom hook for using socket.io
 export const useSocket = () => {
-  const [isConnected, setIsConnected] = useState(socket.connected);
-  const [lastMessage, setLastMessage] = useState(null);
+  const [isConnected, setIsConnected] = useState(false);
   const [messages, setMessages] = useState([]);
   const [users, setUsers] = useState([]);
-  const [typingUsers, setTypingUsers] = useState([]);
+  const [rooms, setRooms] = useState([]);
+  const [activeRoom, setActiveRoom] = useState(null);
+  const [myId, setMyId] = useState(null);
+  const [typingUsersByRoom, setTypingUsersByRoom] = useState({});
+  const [error, setError] = useState('');
+  const usernameRef = useRef('');
 
-  // Connect to socket server
-  const connect = (username) => {
-    socket.connect();
-    if (username) {
-      socket.emit('user_join', username);
-    }
-  };
-
-  // Disconnect from socket server
-  const disconnect = () => {
-    socket.disconnect();
-  };
-
-  // Send a message
-  const sendMessage = (message) => {
-    socket.emit('send_message', { message });
-  };
-
-  // Send a private message
-  const sendPrivateMessage = (to, message) => {
-    socket.emit('private_message', { to, message });
-  };
-
-  // Set typing status
-  const setTyping = (isTyping) => {
-    socket.emit('typing', isTyping);
-  };
-
-  // Socket event listeners
   useEffect(() => {
-    // Connection events
-    const onConnect = () => {
+    socket.on('connect', () => {
       setIsConnected(true);
-    };
+      setMyId(socket.id);
+    });
 
-    const onDisconnect = () => {
+    socket.on('disconnect', () => {
       setIsConnected(false);
-    };
+    });
 
-    // Message events
-    const onReceiveMessage = (message) => {
-      setLastMessage(message);
-      setMessages((prev) => [...prev, message]);
-    };
+    socket.on('chat:message', (msg) => {
+      setMessages((prev) => [...prev, msg]);
+    });
 
-    const onPrivateMessage = (message) => {
-      setLastMessage(message);
-      setMessages((prev) => [...prev, message]);
-    };
+    socket.on('chat:users', (allUsers) => {
+      setUsers(allUsers);
+    });
 
-    // User events
-    const onUserList = (userList) => {
-      setUsers(userList);
-    };
+    socket.on('chat:rooms', (serverRooms) => {
+      setRooms(serverRooms);
+    });
 
-    const onUserJoined = (user) => {
-      // You could add a system message here
-      setMessages((prev) => [
+    socket.on('chat:joinedRoom', (roomId) => {
+      setActiveRoom(roomId);
+    });
+
+    socket.on('chat:typing', ({ roomId, username }) => {
+      setTypingUsersByRoom(prev => ({
         ...prev,
-        {
-          id: Date.now(),
-          system: true,
-          message: `${user.username} joined the chat`,
-          timestamp: new Date().toISOString(),
-        },
-      ]);
-    };
+        [roomId]: [...new Set([...(prev[roomId] || []), username])]
+      }));
+    });
 
-    const onUserLeft = (user) => {
-      // You could add a system message here
-      setMessages((prev) => [
+    socket.on('chat:stopTyping', ({ roomId, username }) => {
+      setTypingUsersByRoom(prev => ({
         ...prev,
-        {
-          id: Date.now(),
-          system: true,
-          message: `${user.username} left the chat`,
-          timestamp: new Date().toISOString(),
-        },
-      ]);
-    };
+        [roomId]: (prev[roomId] || []).filter(name => name !== username)
+      }));
+    });
 
-    // Typing events
-    const onTypingUsers = (users) => {
-      setTypingUsers(users);
-    };
+    socket.on('chat:error', (msg) => {
+      setError(msg);
+    });
 
-    // Register event listeners
-    socket.on('connect', onConnect);
-    socket.on('disconnect', onDisconnect);
-    socket.on('receive_message', onReceiveMessage);
-    socket.on('private_message', onPrivateMessage);
-    socket.on('user_list', onUserList);
-    socket.on('user_joined', onUserJoined);
-    socket.on('user_left', onUserLeft);
-    socket.on('typing_users', onTypingUsers);
-
-    // Clean up event listeners
     return () => {
-      socket.off('connect', onConnect);
-      socket.off('disconnect', onDisconnect);
-      socket.off('receive_message', onReceiveMessage);
-      socket.off('private_message', onPrivateMessage);
-      socket.off('user_list', onUserList);
-      socket.off('user_joined', onUserJoined);
-      socket.off('user_left', onUserLeft);
-      socket.off('typing_users', onTypingUsers);
+      socket.off();
     };
   }, []);
 
+  const connect = useCallback((username) => {
+    usernameRef.current = username;
+    socket.emit('user:join', username);
+  }, []);
+
+  const disconnect = useCallback(() => {
+    socket.disconnect();
+  }, []);
+
+  const sendMessage = useCallback((text, roomId) => {
+    socket.emit('chat:message', { text, roomId });
+  }, []);
+
+  const sendPrivateMessage = useCallback((receiverId, text) => {
+    socket.emit('chat:privateMessage', { to: receiverId, text });
+  }, []);
+
+  const setTyping = useCallback((typing, roomId) => {
+    if (typing) {
+      socket.emit('chat:typing', { roomId, username: usernameRef.current });
+    } else {
+      socket.emit('chat:stopTyping', { roomId, username: usernameRef.current });
+    }
+  }, []);
+
+  const createRoom = useCallback((roomName) => {
+    socket.emit('chat:createRoom', roomName);
+  }, []);
+
+  const joinRoom = useCallback((roomId) => {
+    socket.emit('chat:joinRoom', roomId);
+  }, []);
+
+  const addReaction = useCallback((messageId, emoji) => {
+    socket.emit('chat:reaction', { messageId, emoji });
+  }, []);
+
   return {
-    socket,
     isConnected,
-    lastMessage,
     messages,
     users,
-    typingUsers,
+    rooms,
+    activeRoom,
+    myId,
+    typingUsersByRoom,
     connect,
     disconnect,
     sendMessage,
     sendPrivateMessage,
     setTyping,
+    createRoom,
+    joinRoom,
+    setActiveRoom,
+    addReaction,
+    error,
+    setError,
   };
 };
-
-export default socket; 

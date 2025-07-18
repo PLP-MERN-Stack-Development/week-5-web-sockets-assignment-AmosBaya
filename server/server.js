@@ -28,8 +28,9 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // Store connected users and messages
 const users = {};
-const messages = [];
+const messages = []; // legacy, keep for global
 const typingUsers = {};
+const rooms = { global: { name: 'Global', messages: [] } };
 
 // Socket.io connection handler
 io.on('connection', (socket) => {
@@ -40,45 +41,91 @@ io.on('connection', (socket) => {
     users[socket.id] = { username, id: socket.id };
     io.emit('user_list', Object.values(users));
     io.emit('user_joined', { username, id: socket.id });
+    socket.join('global');
+    socket.emit('room_list', Object.keys(rooms).map((k) => ({ id: k, name: rooms[k].name })));
+    socket.emit('joined_room', { roomId: 'global', name: 'Global' });
     console.log(`${username} joined the chat`);
   });
 
-  // Handle chat messages
-  socket.on('send_message', (messageData) => {
-    const message = {
-      ...messageData,
+  // Handle creating a room
+  socket.on('create_room', (roomName) => {
+    if (!roomName || typeof roomName !== 'string' || !roomName.trim()) {
+      socket.emit('error_event', { message: 'Room name cannot be empty.' });
+      return;
+    }
+    if (Object.values(rooms).some((r) => r.name.toLowerCase() === roomName.trim().toLowerCase())) {
+      socket.emit('error_event', { message: 'Room name already exists.' });
+      return;
+    }
+    const roomId = `room_${Date.now()}`;
+    rooms[roomId] = { name: roomName, messages: [] };
+    io.emit('room_list', Object.keys(rooms).map((k) => ({ id: k, name: rooms[k].name })));
+  });
+
+  // Handle joining a room
+  socket.on('join_room', (roomId) => {
+    Object.keys(rooms).forEach((rid) => socket.leave(rid));
+    socket.join(roomId);
+    socket.emit('joined_room', { roomId, name: rooms[roomId]?.name });
+    // Send last 100 messages for the room
+    socket.emit('room_messages', rooms[roomId]?.messages?.slice(-100) || []);
+  });
+
+  // Handle chat messages (room-aware)
+  socket.on('send_message', ({ message, roomId = 'global' }) => {
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      socket.emit('error_event', { message: 'Cannot send an empty message.' });
+      return;
+    }
+    const msg = {
       id: Date.now(),
+      message,
       sender: users[socket.id]?.username || 'Anonymous',
       senderId: socket.id,
       timestamp: new Date().toISOString(),
+      roomId,
+      reactions: {}, // emoji: [userId, ...]
     };
-    
-    messages.push(message);
-    
-    // Limit stored messages to prevent memory issues
-    if (messages.length > 100) {
-      messages.shift();
+    if (rooms[roomId]) {
+      rooms[roomId].messages.push(msg);
+      if (rooms[roomId].messages.length > 100) rooms[roomId].messages.shift();
+      io.to(roomId).emit('receive_message', msg);
     }
-    
-    io.emit('receive_message', message);
   });
 
-  // Handle typing indicator
-  socket.on('typing', (isTyping) => {
+  // Handle message reactions
+  socket.on('add_reaction', ({ messageId, emoji, roomId = 'global', userId }) => {
+    if (!rooms[roomId]) return;
+    const msg = rooms[roomId].messages.find((m) => m.id === messageId);
+    if (!msg) return;
+    if (!msg.reactions) msg.reactions = {};
+    if (!msg.reactions[emoji]) msg.reactions[emoji] = [];
+    // Toggle reaction: add if not present, remove if present
+    const idx = msg.reactions[emoji].indexOf(userId);
+    if (idx === -1) {
+      msg.reactions[emoji].push(userId);
+    } else {
+      msg.reactions[emoji].splice(idx, 1);
+      if (msg.reactions[emoji].length === 0) delete msg.reactions[emoji];
+    }
+    io.to(roomId).emit('update_reactions', { messageId, reactions: msg.reactions });
+  });
+
+  // Handle typing indicator (room-aware)
+  socket.on('typing', ({ isTyping, roomId = 'global' }) => {
     if (users[socket.id]) {
       const username = users[socket.id].username;
-      
+      if (!typingUsers[roomId]) typingUsers[roomId] = {};
       if (isTyping) {
-        typingUsers[socket.id] = username;
+        typingUsers[roomId][socket.id] = username;
       } else {
-        delete typingUsers[socket.id];
+        delete typingUsers[roomId][socket.id];
       }
-      
-      io.emit('typing_users', Object.values(typingUsers));
+      io.to(roomId).emit('typing_users', Object.values(typingUsers[roomId] || {}));
     }
   });
 
-  // Handle private messages
+  // Handle private messages (unchanged)
   socket.on('private_message', ({ to, message }) => {
     const messageData = {
       id: Date.now(),
@@ -87,8 +134,8 @@ io.on('connection', (socket) => {
       message,
       timestamp: new Date().toISOString(),
       isPrivate: true,
+      receiverId: to,
     };
-    
     socket.to(to).emit('private_message', messageData);
     socket.emit('private_message', messageData);
   });
@@ -100,12 +147,12 @@ io.on('connection', (socket) => {
       io.emit('user_left', { username, id: socket.id });
       console.log(`${username} left the chat`);
     }
-    
     delete users[socket.id];
-    delete typingUsers[socket.id];
-    
+    Object.values(typingUsers).forEach((room) => delete room[socket.id]);
     io.emit('user_list', Object.values(users));
-    io.emit('typing_users', Object.values(typingUsers));
+    Object.keys(rooms).forEach((roomId) => {
+      io.to(roomId).emit('typing_users', Object.values(typingUsers[roomId] || {}));
+    });
   });
 });
 
@@ -116,6 +163,11 @@ app.get('/api/messages', (req, res) => {
 
 app.get('/api/users', (req, res) => {
   res.json(Object.values(users));
+});
+
+// New: get all rooms
+app.get('/api/rooms', (req, res) => {
+  res.json(Object.keys(rooms).map((k) => ({ id: k, name: rooms[k].name })));
 });
 
 // Root route
